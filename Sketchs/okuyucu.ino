@@ -8,6 +8,7 @@ static const uint8_t  FLASH_WP   = 46; // WP#
 static const uint8_t  FLASH_HOLD = 48; // HOLD#
 static const uint32_t FLASH_SIZE = 2UL * 1024UL * 1024UL; // 2MB
 static const uint16_t SECTOR_SZ  = 4096;
+static const uint32_t MAX_IMAGE_SIZE = FLASH_SIZE - SECTOR_SZ;
 
 SPISettings flashSPI(500000, MSBFIRST, SPI_MODE0);
 
@@ -21,6 +22,7 @@ static const uint32_t FOOTER_BASE   = FLASH_SIZE - SECTOR_SZ;
 static const uint32_t FOOTER_ADDR   = FOOTER_BASE;
 static const char     FOOTER_MAGIC[] = "EXUPv1"; // 6B
 static const uint8_t  FOOTER_LEN     = 16;       // [MAGIC6][RES2][SIZE4][FNV4]
+static const char*    g_footerError  = nullptr;
 
 // ---- SPI helpers ----
 inline void fsel()   { digitalWrite(FLASH_CS, LOW); }
@@ -68,9 +70,26 @@ uint32_t fnv1a_flash(uint32_t size) {
 bool readFooter(uint32_t &size, uint32_t &hash) {
   uint8_t f[FOOTER_LEN];
   flashRead(FOOTER_ADDR, f, FOOTER_LEN);
+  g_footerError = "FOOTER NOT FOUND or MAGIC MISMATCH";
   if (memcmp(f, FOOTER_MAGIC, 6)!=0) return false;
+
+  if (f[6] != 0 || f[7] != 0) {
+    g_footerError = "FOOTER INVALID: RESERVED BYTES ARE NON-ZERO";
+    return false;
+  }
+
   size = (uint32_t)f[8]  | ((uint32_t)f[9]  <<8) | ((uint32_t)f[10] <<16) | ((uint32_t)f[11] <<24);
   hash = (uint32_t)f[12] | ((uint32_t)f[13] <<8) | ((uint32_t)f[14] <<16) | ((uint32_t)f[15] <<24);
+  if (size == 0) {
+    g_footerError = "FOOTER INVALID: SIZE FIELD IS ZERO";
+    return false;
+  }
+  if (size > MAX_IMAGE_SIZE) {
+    g_footerError = "FOOTER INVALID: SIZE EXCEEDS ALLOWABLE FLASH RANGE";
+    return false;
+  }
+
+  g_footerError = nullptr;
   return true;
 }
 
@@ -102,7 +121,8 @@ void setup() {
 
   uint32_t size=0, hash=0;
   if (!readFooter(size, hash)) {
-    Serial.println("FOOTER NOT FOUND or MAGIC MISMATCH");
+    if (g_footerError) Serial.println(g_footerError);
+    else Serial.println("FOOTER INVALID");
     return;
   }
 
