@@ -3,6 +3,8 @@ import sys, struct, serial, time
 
 FNV_OFFSET = 0x811C9DC5
 FNV_PRIME  = 0x01000193
+FLASH_SIZE = 2 * 1024 * 1024
+FOOTER_RESERVATION = 4096
 
 def fnv1a(data: bytes) -> int:
     h = FNV_OFFSET
@@ -41,8 +43,11 @@ def main():
     size = len(data)
     if size == 0:
         print("Empty file"); sys.exit(1)
-    if size > 2*1024*1024:
-        print("Too big for 2MB flash"); sys.exit(1)
+    max_payload = FLASH_SIZE - FOOTER_RESERVATION
+    if size > max_payload:
+        raise ValueError(
+            f"Payload of {size} bytes exceeds usable flash capacity of {max_payload} bytes; the last 4KB are reserved for the footer sector."
+        )
 
     h = fnv1a(data)
 
