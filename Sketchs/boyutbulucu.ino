@@ -1,4 +1,5 @@
-﻿#include <SPI.h>
+#include <SPI.h>
+#include <string.h>
 
 // Mega2560 + TXB0106 + SST25VF016B (2MB SPI NOR)
 // Pins: CS(CE#)=D44, WP#=D46, HOLD#=D48, SPI: MISO=50 MOSI=51 SCK=52
@@ -7,6 +8,12 @@ static const uint8_t  FLASH_CS   = 44; // CE#
 static const uint8_t  FLASH_WP   = 46; // WP#
 static const uint8_t  FLASH_HOLD = 48; // HOLD#
 static const uint32_t FLASH_SIZE = 2UL * 1024UL * 1024UL; // 2MB
+static const uint16_t SECTOR_SZ  = 4096;
+
+static const uint32_t FOOTER_BASE    = FLASH_SIZE - SECTOR_SZ;
+static const uint32_t FOOTER_ADDR    = FOOTER_BASE;
+static const uint8_t  FOOTER_LEN     = 16;
+static const char     FOOTER_MAGIC[] = "EXUPv1"; // 6B magic
 
 SPISettings flashSPI(500000, MSBFIRST, SPI_MODE0); // güvenli hız
 
@@ -49,24 +56,40 @@ void flashReadJEDEC(uint8_t &m, uint8_t &t, uint8_t &c) {
   SPI.endTransaction();
 }
 
+bool readFooterSize(uint32_t &size) {
+  uint8_t footer[FOOTER_LEN];
+  flashRead(FOOTER_ADDR, footer, FOOTER_LEN);
+  if (memcmp(footer, FOOTER_MAGIC, 6) != 0) return false;
+
+  size = (uint32_t)footer[8]
+       | ((uint32_t)footer[9]  << 8)
+       | ((uint32_t)footer[10] << 16)
+       | ((uint32_t)footer[11] << 24);
+
+  if (size > FOOTER_BASE) return false; // footer rezerv alanın sonrasında olamaz
+  return true;
+}
+
 uint32_t detectStoredSize() {
   const uint16_t STEP = 256;         // blok okuma
   uint8_t buf[STEP];
   // Baştan varsayılan: boş
   int64_t last_non_ff = -1;
 
-  // Sondan geriye doğru tara: [FLASH_SIZE-STEP ... 0]
-  for (int64_t addr = (int64_t)FLASH_SIZE - STEP; addr >= 0; addr -= STEP) {
-    flashRead((uint32_t)addr, buf, STEP);
+  // Sondan geriye doğru tara ama footer sektöründen önce dur
+  int64_t addr = (int64_t)FOOTER_BASE;
+  while (addr > 0) {
+    uint16_t chunk = (addr >= STEP) ? STEP : (uint16_t)addr;
+    addr -= chunk;
+    flashRead((uint32_t)addr, buf, chunk);
     // Bu blokta 0xFF olmayan var mı?
-    int last = -1;
-    for (int i = STEP-1; i >= 0; --i) {
-      if (buf[i] != 0xFF) { last = i; break; }
+    for (int i = chunk - 1; i >= 0; --i) {
+      if (buf[i] != 0xFF) {
+        last_non_ff = addr + i;
+        break;
+      }
     }
-    if (last >= 0) {
-      last_non_ff = addr + last;
-      break;
-    }
+    if (last_non_ff >= 0) break;
   }
 
   if (last_non_ff < 0) return 0;           // tamamen boş (hepsi 0xFF)
@@ -107,13 +130,22 @@ void setup() {
   Serial.print("JEDEC "); Serial.print(m,HEX); Serial.print(' ');
   Serial.print(t,HEX); Serial.print(' '); Serial.println(c,HEX);
 
-  uint32_t size = detectStoredSize();
-  Serial.print("Detected size: ");
-  Serial.print(size);
-  Serial.print(" bytes (");
-  float kb = size / 1024.0f;
-  Serial.print(kb, 2);
-  Serial.println(" KB)");
+  uint32_t footerSize = 0;
+  if (readFooterSize(footerSize)) {
+    Serial.print("Footer size: ");
+    Serial.print(footerSize);
+    Serial.print(" bytes (");
+    Serial.print(footerSize / 1024.0f, 2);
+    Serial.println(" KB)");
+  } else {
+    Serial.println("Footer not found, scanning flash...");
+    uint32_t size = detectStoredSize();
+    Serial.print("Detected size: ");
+    Serial.print(size);
+    Serial.print(" bytes (");
+    Serial.print(size / 1024.0f, 2);
+    Serial.println(" KB)");
+  }
 
   // Opsiyonel: ilk 64 baytı göster (Intel-HEX ise ':' ile başlar = 0x3A)
   dumpHead(64);
