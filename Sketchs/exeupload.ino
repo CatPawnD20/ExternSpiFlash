@@ -293,7 +293,8 @@ void loop() {
 
   uint32_t fsize = rdU32LE(&hdr[4]);
   uint32_t fhash = rdU32LE(&hdr[8]);
-  if (fsize==0 || fsize>FLASH_SIZE) { Serial.println("SIZEERR"); return; }
+  // Last 4KB sector reserved for footer metadata.
+  if (fsize==0 || fsize>FOOTER_SECTOR_BASE) { Serial.println("SIZEERR"); return; }
 
   // Yalnızca dosyanın kapsadığı sektörleri sil
   uint32_t last = fsize - 1;
