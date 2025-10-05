@@ -15,6 +15,10 @@ static const uint32_t FOOTER_ADDR    = FOOTER_BASE;
 static const uint8_t  FOOTER_LEN     = 16;
 static const char     FOOTER_MAGIC[] = "EXUPv1"; // 6B magic
 
+// FNV-1a constants (mirrors bootloader)
+#define FNV_OFFSET 0x811C9DC5UL
+#define FNV_PRIME  0x01000193UL
+
 SPISettings flashSPI(500000, MSBFIRST, SPI_MODE0); // güvenli hız
 
 // Komutlar
@@ -56,7 +60,38 @@ void flashReadJEDEC(uint8_t &m, uint8_t &t, uint8_t &c) {
   SPI.endTransaction();
 }
 
-bool readFooterSize(uint32_t &size) {
+static int hex2nib(uint8_t c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  return -1;
+}
+
+static int get_hex_byte(uint8_t hi, uint8_t lo) {
+  int a = hex2nib(hi);
+  int b = hex2nib(lo);
+  if (a < 0 || b < 0) return -1;
+  return (a << 4) | b;
+}
+
+uint32_t fnv1a_over_flash(uint32_t size) {
+  uint8_t tmp[256];
+  uint32_t hash = FNV_OFFSET;
+  uint32_t addr = 0;
+  while (size) {
+    uint16_t n = (size > sizeof(tmp)) ? sizeof(tmp) : (uint16_t)size;
+    flashRead(addr, tmp, n);
+    for (uint16_t i = 0; i < n; i++) {
+      hash ^= tmp[i];
+      hash *= FNV_PRIME;
+    }
+    addr += n;
+    size -= n;
+  }
+  return hash;
+}
+
+bool readFooter(uint32_t &size, uint32_t &fnv) {
   uint8_t footer[FOOTER_LEN];
   flashRead(FOOTER_ADDR, footer, FOOTER_LEN);
   if (memcmp(footer, FOOTER_MAGIC, 6) != 0) return false;
@@ -66,8 +101,132 @@ bool readFooterSize(uint32_t &size) {
        | ((uint32_t)footer[10] << 16)
        | ((uint32_t)footer[11] << 24);
 
-  if (size > FOOTER_BASE) return false; // footer rezerv alanın sonrasında olamaz
+  fnv = (uint32_t)footer[12]
+      | ((uint32_t)footer[13] << 8)
+      | ((uint32_t)footer[14] << 16)
+      | ((uint32_t)footer[15] << 24);
+
+  if (size == 0 || size > FOOTER_BASE) return false; // footer rezerv alanın sonrasında olamaz
   return true;
+}
+
+bool verifyIntelHexImage(uint32_t totalSize, String &reason) {
+  uint8_t buf[256];
+  uint32_t off = 0;
+  uint32_t extBase = 0;
+  uint8_t line[128];
+  uint8_t data[64];
+  uint16_t li = 0;
+  bool inLine = false;
+  bool seenEOF = false;
+
+  while (off < totalSize) {
+    uint16_t n = (uint16_t)((totalSize - off > sizeof(buf)) ? sizeof(buf) : (totalSize - off));
+    flashRead(off, buf, n);
+    off += n;
+
+    for (uint16_t i = 0; i < n; i++) {
+      uint8_t c = buf[i];
+
+      if (!inLine) {
+        if (c == ':') {
+          inLine = true;
+          li = 0;
+        }
+        continue;
+      }
+
+      if (c == '\n' || c == '\r') {
+        if (li < 10) {
+          inLine = false;
+          continue;
+        }
+
+        int LL  = get_hex_byte(line[0], line[1]);
+        int AHi = get_hex_byte(line[2], line[3]);
+        int ALo = get_hex_byte(line[4], line[5]);
+        int TT  = get_hex_byte(line[6], line[7]);
+        if (LL < 0 || AHi < 0 || ALo < 0 || TT < 0) {
+          inLine = false;
+          continue;
+        }
+
+        uint8_t len = (uint8_t)LL;
+        uint16_t need = 8 + (uint16_t)len * 2 + 2;
+        if (li < need) {
+          reason = F("Record truncated before checksum");
+          inLine = false;
+          return false;
+        }
+
+        uint8_t sum = len + (uint8_t)AHi + (uint8_t)ALo + (uint8_t)TT;
+
+        if (len > sizeof(data)) {
+          reason = F("Record data length exceeds buffer");
+          inLine = false;
+          return false;
+        }
+
+        uint16_t p = 8;
+        for (uint8_t k = 0; k < len; k++) {
+          int b = get_hex_byte(line[p], line[p + 1]);
+          if (b < 0) {
+            reason = F("Invalid hex digit in data field");
+            inLine = false;
+            return false;
+          }
+          data[k] = (uint8_t)b;
+          sum += (uint8_t)b;
+          p += 2;
+        }
+
+        int CC = get_hex_byte(line[p], line[p + 1]);
+        if (CC < 0) {
+          reason = F("Invalid checksum field");
+          inLine = false;
+          return false;
+        }
+        sum += (uint8_t)CC;
+        if ((sum & 0xFF) != 0) {
+          reason = F("Checksum mismatch");
+          inLine = false;
+          return false;
+        }
+
+        if (TT == 0x00) {
+          // data, nothing to do besides validation
+        } else if (TT == 0x01) {
+          seenEOF = true;
+          return true;
+        } else if (TT == 0x04) {
+          if (len != 2) {
+            reason = F("Invalid extended linear address length");
+            inLine = false;
+            return false;
+          }
+          uint16_t upper = ((uint16_t)data[0] << 8) | data[1];
+          extBase = ((uint32_t)upper) << 16;
+          (void)extBase;
+        } else {
+          // ignore other record types
+        }
+
+        inLine = false;
+        continue;
+      }
+
+      if (li < sizeof(line)) {
+        line[li++] = c;
+      } else {
+        reason = F("Line buffer overflow");
+        inLine = false;
+        return false;
+      }
+    }
+  }
+
+  reason = seenEOF ? String() : String(F("EOF record missing"));
+  return seenEOF;
 }
 
 uint32_t detectStoredSize() {
@@ -131,21 +290,38 @@ void setup() {
   Serial.print(t,HEX); Serial.print(' '); Serial.println(c,HEX);
 
   uint32_t footerSize = 0;
-  if (readFooterSize(footerSize)) {
-    Serial.print("Footer size: ");
-    Serial.print(footerSize);
-    Serial.print(" bytes (");
-    Serial.print(footerSize / 1024.0f, 2);
-    Serial.println(" KB)");
-  } else {
-    Serial.println("Footer not found, scanning flash...");
-    uint32_t size = detectStoredSize();
-    Serial.print("Detected size: ");
-    Serial.print(size);
-    Serial.print(" bytes (");
-    Serial.print(size / 1024.0f, 2);
-    Serial.println(" KB)");
+  uint32_t footerHash = 0;
+  if (!readFooter(footerSize, footerHash)) {
+    Serial.println("Footer not found or invalid. No verified image present.");
+    return;
   }
+
+  Serial.println("Footer found. Verifying hash and Intel HEX records...");
+
+  uint32_t computedHash = fnv1a_over_flash(footerSize);
+  if (computedHash != footerHash) {
+    Serial.print("FNV mismatch. Expected 0x");
+    Serial.print(footerHash, HEX);
+    Serial.print(", got 0x");
+    Serial.println(computedHash, HEX);
+    return;
+  }
+
+  String reason;
+  if (!verifyIntelHexImage(footerSize, reason)) {
+    Serial.print("Intel HEX verification failed: ");
+    Serial.println(reason);
+    return;
+  }
+
+  Serial.println("Image accepted by bootloader rules.");
+  Serial.print("Size: ");
+  Serial.print(footerSize);
+  Serial.print(" bytes (");
+  Serial.print(footerSize / 1024.0f, 2);
+  Serial.println(" KB)");
+  Serial.print("FNV-1a: 0x");
+  Serial.println(computedHash, HEX);
 
   // Opsiyonel: ilk 64 baytı göster (Intel-HEX ise ':' ile başlar = 0x3A)
   dumpHead(64);
