@@ -1,5 +1,4 @@
 # pip install pyserial
-import argparse
 import sys
 import struct
 import serial
@@ -46,25 +45,10 @@ def ensure_intel_hex(data: bytes, path: str) -> bytes:
         )
     return data
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="EXUP loader'a Intel HEX dosyası gönderir"
-    )
-    parser.add_argument(
-        "image",
-        help="SPI flash'a yazılacak Intel HEX dosyasının yolu"
-    )
-    parser.add_argument(
-        "--port",
-        default="COM12",
-        help="Seri port (varsayılan: COM12)"
-    )
-    return parser.parse_args()
-
 def main():
-    args = parse_args()
-    port = args.port
-    path = args.image
+    # Gömülü ayarlar (gerekirse düzenleyin)
+    port = "COM12"
+    path = r"C:\\Users\\CatPawnD20\\Desktop\\ZDA - GPS\\EXE\\braud.ino.hex"
 
     # Dosyayı oku
     with open(path, "rb") as f:
