@@ -198,6 +198,164 @@ uint32_t fnv1a_flash(uint32_t size) {
   return h;
 }
 
+// ---- Intel HEX Yardımcıları ----
+int hex2nib(uint8_t c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  return -1;
+}
+int get_hex_byte(uint8_t hi, uint8_t lo) {
+  int a = hex2nib(hi), b = hex2nib(lo);
+  if (a < 0 || b < 0) return -1;
+  return (a << 4) | b;
+}
+
+struct HexParserState {
+  bool     inLine;
+  bool     seenEOF;
+  uint16_t lineLen;
+  uint8_t  line[128];
+  uint32_t extBase;
+};
+
+void hexParserInit(HexParserState &st) {
+  st.inLine  = false;
+  st.seenEOF = false;
+  st.lineLen = 0;
+  st.extBase = 0;
+}
+
+bool hexParserProcess(HexParserState &st, const uint8_t *buf, uint16_t len, const char* &err) {
+  for (uint16_t i = 0; i < len; i++) {
+    uint8_t c = buf[i];
+
+    if (st.seenEOF) {
+      if (c == '\r' || c == '\n' || c == 0x1A) continue;
+      err = "HEX_AFTER_EOF";
+      return false;
+    }
+
+    if (!st.inLine) {
+      if (c == ':') {
+        st.inLine = true;
+        st.lineLen = 0;
+      } else if (c == '\r' || c == '\n') {
+        // boş satırlar kabul
+      } else {
+        err = "HEX_SYNC";
+        return false;
+      }
+      continue;
+    }
+
+    if (c == '\r' || c == '\n') {
+      if (st.lineLen < 10) {
+        st.inLine = false;
+        err = "HEX_LINE_SHORT";
+        return false;
+      }
+
+      int LL  = get_hex_byte(st.line[0], st.line[1]);
+      int AHi = get_hex_byte(st.line[2], st.line[3]);
+      int ALo = get_hex_byte(st.line[4], st.line[5]);
+      int TT  = get_hex_byte(st.line[6], st.line[7]);
+      if (LL < 0 || AHi < 0 || ALo < 0 || TT < 0) {
+        st.inLine = false;
+        err = "HEX_FIELD";
+        return false;
+      }
+
+      uint16_t need = 8 + (uint16_t)((uint8_t)LL) * 2 + 2;
+      if (st.lineLen != need) {
+        st.inLine = false;
+        err = (st.lineLen < need) ? "HEX_LENGTH" : "HEX_LINE_LONG";
+        return false;
+      }
+
+      uint8_t sum = (uint8_t)LL + (uint8_t)AHi + (uint8_t)ALo + (uint8_t)TT;
+      uint8_t data[64];
+      uint8_t lenBytes = (uint8_t)LL;
+      if (lenBytes > sizeof(data)) {
+        st.inLine = false;
+        err = "HEX_DATA_TOO_LONG";
+        return false;
+      }
+
+      uint16_t p = 8;
+      for (uint8_t k = 0; k < lenBytes; k++) {
+        int b = get_hex_byte(st.line[p], st.line[p + 1]);
+        if (b < 0) {
+          st.inLine = false;
+          err = "HEX_FIELD";
+          return false;
+        }
+        data[k] = (uint8_t)b;
+        sum += (uint8_t)b;
+        p += 2;
+      }
+
+      int CC = get_hex_byte(st.line[p], st.line[p + 1]);
+      if (CC < 0) {
+        st.inLine = false;
+        err = "HEX_FIELD";
+        return false;
+      }
+      sum += (uint8_t)CC;
+      if ((sum & 0xFF) != 0) {
+        st.inLine = false;
+        err = "HEX_CHECKSUM";
+        return false;
+      }
+
+      if (TT == 0x00) {
+        // data record → adres alanı sadece doğrulama için, dış flash yazımı adres gözetmiyor
+        // Üst adres kayıtları sadece sıfırlanır
+      } else if (TT == 0x01) {
+        if (lenBytes != 0) {
+          st.inLine = false;
+          err = "HEX_EOF_LEN";
+          return false;
+        }
+        st.seenEOF = true;
+      } else if (TT == 0x04) {
+        if (lenBytes != 2) {
+          st.inLine = false;
+          err = "HEX_EXT_LEN";
+          return false;
+        }
+        st.extBase = ((uint32_t)data[0] << 8 | data[1]) << 16;
+      } else {
+        // diğer kayıt tipleri yoksayılır
+      }
+
+      st.inLine = false;
+      continue;
+    }
+
+    if (st.lineLen >= sizeof(st.line)) {
+      st.inLine = false;
+      err = "HEX_LINE_LONG";
+      return false;
+    }
+    st.line[st.lineLen++] = c;
+  }
+
+  return true;
+}
+
+bool hexParserFinalize(const HexParserState &st, const char* &err) {
+  if (st.inLine) {
+    err = "HEX_PARTIAL";
+    return false;
+  }
+  if (!st.seenEOF) {
+    err = "HEX_NO_EOF";
+    return false;
+  }
+  return true;
+}
+
 // ---- Host IO ----
 bool readExact(uint8_t* buf, size_t n, unsigned long to=15000) {
   size_t got=0; unsigned long t0=millis();
@@ -311,9 +469,34 @@ void loop() {
   // Host'tan 256B bloklar halinde al; AAI ile yaz ve doğrula
   uint8_t page[PAGE_SIZE], back[PAGE_SIZE];
   uint32_t addr=0, remain=fsize;
+  uint32_t runningFNV = 2166136261UL;
+  HexParserState parser;
+  hexParserInit(parser);
+  bool parserFinalized = false;
   while (remain) {
     uint16_t n = (remain > PAGE_SIZE) ? PAGE_SIZE : remain;
     if (!readExact(page, n, 20000)) { Serial.write(0x15); Serial.println("RXERR"); Serial.println("ERR"); return; }
+
+    const char* perr = NULL;
+    if (!hexParserProcess(parser, page, n, perr)) {
+      Serial.write(0x15);
+      Serial.println(perr ? perr : "HEXERR");
+      Serial.println("ERR");
+      return;
+    }
+
+    bool lastChunk = (remain == n);
+    if (lastChunk) {
+      parserFinalized = true;
+      if (!hexParserFinalize(parser, perr)) {
+        Serial.write(0x15);
+        Serial.println(perr ? perr : "HEXERR");
+        Serial.println("ERR");
+        return;
+      }
+    }
+
+    runningFNV = fnv1a_update(runningFNV, page, n);
 
     if (!flashProgram_AAI(addr, page, n)) { Serial.write(0x15); Serial.println("TIMEOUT_PP"); Serial.println("ERR"); return; }
 
@@ -330,6 +513,23 @@ void loop() {
     Serial.write(0x06); // ACK
     addr   += n;
     remain -= n;
+  }
+
+  if (!parserFinalized) {
+    const char* perr = NULL;
+    if (!hexParserFinalize(parser, perr)) {
+      Serial.write(0x15);
+      Serial.println(perr ? perr : "HEXERR");
+      Serial.println("ERR");
+      return;
+    }
+  }
+
+  if (runningFNV != fhash) {
+    Serial.write(0x15);
+    Serial.println("HASH_MISMATCH");
+    Serial.println("ERR");
+    return;
   }
 
   // Tüm-dosya hash doğrulaması
