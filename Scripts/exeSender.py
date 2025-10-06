@@ -1,5 +1,8 @@
-﻿# pip install pyserial
-import sys, struct, serial, time
+# pip install pyserial
+import sys
+import struct
+import serial
+import time
 
 FNV_OFFSET = 0x811C9DC5
 FNV_PRIME  = 0x01000193
@@ -32,17 +35,30 @@ def print_any_pending_lines(ser):
         if line:
             print("DEVICE>", line)
 
+def ensure_intel_hex(data: bytes, path: str) -> bytes:
+    """Intel HEX beklenirken yanlışlıkla .bin göndermeyi engelle."""
+    stripped = data.lstrip()
+    if not stripped.startswith(b":"):
+        raise ValueError(
+            f"{path} dosyası Intel HEX gibi görünmüyor; ilk anlamlı karakter ':' değil. "
+            "Bootloader yalnızca HEX akışını kabul eder."
+        )
+    return data
+
 def main():
-    # Gömülü ayarlar (gerekirse değiştir)
+    # Gömülü ayarlar (gerekirse düzenleyin)
     port = "COM12"
-    path = r"C:\Users\CatPawnD20\Desktop\ZDA - GPS\EXE\braud.ino.bin"
+    path = r"C:\\Users\\CatPawnD20\\Desktop\\ZDA - GPS\\EXE\\braud.ino.hex"
 
     # Dosyayı oku
     with open(path, "rb") as f:
-        data = f.read()
-    size = len(data)
-    if size == 0:
+        raw = f.read()
+
+    if len(raw) == 0:
         print("Empty file"); sys.exit(1)
+
+    data = ensure_intel_hex(raw, path)
+    size = len(data)
     max_payload = FLASH_SIZE - FOOTER_RESERVATION
     if size > max_payload:
         raise ValueError(
