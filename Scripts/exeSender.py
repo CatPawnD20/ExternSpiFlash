@@ -34,8 +34,8 @@ def print_any_pending_lines(ser):
 
 def main():
     # Gömülü ayarlar (gerekirse değiştir)
-    port = "COM4"
-    path = r"C:\Users\CatPawnD20\Desktop\ZDA - GPS\EXE\gps-tracker.ino.hex"
+    port = "COM12"
+    path = r"C:\Users\CatPawnD20\Desktop\ZDA - GPS\EXE\braud.ino.bin"
 
     # Dosyayı oku
     with open(path, "rb") as f:

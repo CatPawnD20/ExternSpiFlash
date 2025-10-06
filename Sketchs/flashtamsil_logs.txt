@@ -1,0 +1,5 @@
+﻿
+JEDEC BF 25 41
+Unprotected
+Chip Erase...
+DONE (flash empty)
