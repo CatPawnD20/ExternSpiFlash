@@ -1,0 +1,3 @@
+﻿JEDEC BF 25 41
+SR=0
+READY
