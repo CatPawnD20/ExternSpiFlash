@@ -24,6 +24,7 @@ static const uint32_t FOOTER_ADDR    = FOOTER_BASE;
 static const char     FOOTER_MAGIC[] = "EXUPv1"; // 6B
 static const uint8_t  FOOTER_LEN     = 16;       // [MAGIC6][RES2][SIZE4][FNV4]
 static const char*    g_footerError  = nullptr;
+static const char*    g_parserError  = nullptr;
 
 // EEPROM flag (update requested?)
 static const uint8_t  EEPROM_FLAG_ADDR  = 0;
@@ -69,6 +70,144 @@ uint32_t fnv1a_flash(uint32_t size) {
     size -= n;
   }
   return h;
+}
+
+// ---- Intel HEX helpers ----
+static int hex2nib(uint8_t c) {
+  if (c>='0' && c<='9') return c-'0';
+  if (c>='A' && c<='F') return c-'A'+10;
+  if (c>='a' && c<='f') return c-'a'+10;
+  return -1;
+}
+
+static int get_hex_byte(uint8_t hi, uint8_t lo) {
+  int a = hex2nib(hi);
+  int b = hex2nib(lo);
+  if (a < 0 || b < 0) return -1;
+  return (a << 4) | b;
+}
+
+static bool verifyIntelHexPayload(uint32_t total_size) {
+  uint8_t buf[256];
+  uint32_t off = 0;
+  uint32_t ext_base = 0;
+  uint8_t line[128];
+  uint8_t data[64];
+  uint16_t li = 0;
+  bool in_line = false;
+  bool seen_eof = false;
+
+  g_parserError = "HEX PARSER: EOF RECORD NOT FOUND";
+
+  while (off < total_size) {
+    uint16_t n = (uint16_t)((total_size - off > sizeof(buf)) ? sizeof(buf) : (total_size - off));
+    flashRead(off, buf, n);
+    off += n;
+
+    for (uint16_t i = 0; i < n; i++) {
+      uint8_t c = buf[i];
+
+      if (!in_line) {
+        if (c == ':') { in_line = true; li = 0; }
+        continue;
+      }
+
+      if (c == '\n' || c == '\r') {
+        if (li < 10) { in_line = false; continue; }
+
+        int LL  = get_hex_byte(line[0], line[1]);
+        int AHi = get_hex_byte(line[2], line[3]);
+        int ALo = get_hex_byte(line[4], line[5]);
+        int TT  = get_hex_byte(line[6], line[7]);
+        if (LL < 0 || AHi < 0 || ALo < 0 || TT < 0) {
+          g_parserError = "HEX PARSER: INVALID RECORD HEADER";
+          in_line = false;
+          return false;
+        }
+
+        uint16_t addr16 = ((uint16_t)AHi << 8) | (uint16_t)ALo;
+        uint8_t len = (uint8_t)LL;
+
+        uint16_t need = 8 + (uint16_t)len * 2 + 2;
+        if (li < need) {
+          g_parserError = "HEX PARSER: TRUNCATED RECORD";
+          in_line = false;
+          return false;
+        }
+
+        uint8_t sum = len + AHi + ALo + (uint8_t)TT;
+
+        if (len > sizeof(data)) {
+          g_parserError = "HEX PARSER: DATA FIELD TOO LONG";
+          in_line = false;
+          return false;
+        }
+
+        uint16_t p = 8;
+        for (uint8_t k = 0; k < len; k++) {
+          int b = get_hex_byte(line[p], line[p+1]);
+          if (b < 0) {
+            g_parserError = "HEX PARSER: INVALID DATA BYTE";
+            in_line = false;
+            return false;
+          }
+          data[k] = (uint8_t)b;
+          sum += (uint8_t)b;
+          p += 2;
+        }
+
+        int CC = get_hex_byte(line[p], line[p+1]);
+        if (CC < 0) {
+          g_parserError = "HEX PARSER: INVALID CHECKSUM";
+          in_line = false;
+          return false;
+        }
+        sum += (uint8_t)CC;
+        if ((sum & 0xFF) != 0) {
+          g_parserError = "HEX PARSER: CHECKSUM MISMATCH";
+          in_line = false;
+          return false;
+        }
+
+        if (TT == 0x00) {
+          (void)addr16;
+          for (uint8_t k = 0; k < len; k++) {
+            (void)data[k];
+          }
+        } else if (TT == 0x01) {
+          seen_eof = true;
+          g_parserError = nullptr;
+          return true;
+        } else if (TT == 0x04) {
+          if (len != 2) {
+            g_parserError = "HEX PARSER: INVALID EXTENDED ADDRESS";
+            in_line = false;
+            return false;
+          }
+          uint16_t upper = ((uint16_t)data[0] << 8) | data[1];
+          ext_base = ((uint32_t)upper) << 16;
+          (void)ext_base;
+        }
+
+        in_line = false;
+        continue;
+      }
+
+      if (li < sizeof(line)) line[li++] = c;
+      else {
+        g_parserError = "HEX PARSER: LINE OVERFLOW";
+        in_line = false;
+        return false;
+      }
+    }
+  }
+
+  if (seen_eof) {
+    g_parserError = nullptr;
+    return true;
+  }
+  g_parserError = "HEX PARSER: EOF RECORD NOT FOUND";
+  return false;
 }
 
 // ---- Footer parse ----
@@ -148,8 +287,8 @@ void setup() {
 
   uint32_t size=0, hash=0;
   if (!readFooter(size, hash)) {
+    Serial.println("REJECT: FOOTER MISSING OR INVALID");
     if (g_footerError) Serial.println(g_footerError);
-    else Serial.println("FOOTER INVALID");
     return;
   }
 
@@ -159,11 +298,22 @@ void setup() {
 
   // Bütünlük doğrulaması
   uint32_t calc = fnv1a_flash(size);
-  Serial.print("VERIFY: ");
-  if (calc == hash) Serial.println("OK");
-  else {
-    Serial.print("FAIL (calc=0x"); Serial.print(calc, HEX); Serial.println(")");
+  if (calc != hash) {
+    Serial.print("REJECT: FNV MISMATCH (calc=0x");
+    Serial.print(calc, HEX);
+    Serial.println(")");
+    return;
   }
+
+  Serial.println("FNV MATCH: OK");
+
+  if (!verifyIntelHexPayload(size)) {
+    Serial.println("REJECT: INTEL HEX PARSE FAILURE");
+    if (g_parserError) Serial.println(g_parserError);
+    return;
+  }
+
+  Serial.println("HEX PARSE: OK");
 
   // Opsiyonel: ilk 64 baytı göster
   hexdumpHead(min((uint32_t)64, size));
