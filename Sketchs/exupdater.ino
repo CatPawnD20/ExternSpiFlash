@@ -205,7 +205,6 @@ void postUpdateCleanup() {
 }
 
 void setup() {
-  wdt_disable();
   Serial.begin(115200);
   SPI.begin();
 

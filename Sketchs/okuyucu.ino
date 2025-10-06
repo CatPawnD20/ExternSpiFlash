@@ -1,6 +1,7 @@
 ﻿#include <SPI.h>
+#include <EEPROM.h>
 
-// Mega2560 + TXB0106 + SST25VF016B — FOOTER Reader/Verifier
+// Mega2560 + TXB0106 + SST25VF016B — FOOTER Reader/Verifier (+EEPROM flag)
 // Pins: CS(CE#)=D44, WP#=D46, HOLD#=D48, SPI: MISO=50 MOSI=51 SCK=52
 
 static const uint8_t  FLASH_CS   = 44; // CE#
@@ -18,11 +19,15 @@ SPISettings flashSPI(500000, MSBFIRST, SPI_MODE0);
 #define CMD_JEDECID   0x9F
 
 // Footer
-static const uint32_t FOOTER_BASE   = FLASH_SIZE - SECTOR_SZ;
-static const uint32_t FOOTER_ADDR   = FOOTER_BASE;
+static const uint32_t FOOTER_BASE    = FLASH_SIZE - SECTOR_SZ; // 0x1FF000
+static const uint32_t FOOTER_ADDR    = FOOTER_BASE;
 static const char     FOOTER_MAGIC[] = "EXUPv1"; // 6B
 static const uint8_t  FOOTER_LEN     = 16;       // [MAGIC6][RES2][SIZE4][FNV4]
 static const char*    g_footerError  = nullptr;
+
+// EEPROM flag (update requested?)
+static const uint8_t  EEPROM_FLAG_ADDR  = 0;
+static const uint8_t  EEPROM_FLAG_VALUE = 0xA5;
 
 // ---- SPI helpers ----
 inline void fsel()   { digitalWrite(FLASH_CS, LOW); }
@@ -105,15 +110,37 @@ void hexdumpHead(uint32_t n) { // opsiyonel görsel doğrulama
   }
 }
 
+void printEepromFlag() {
+  uint8_t val = EEPROM.read(EEPROM_FLAG_ADDR);
+  Serial.print("EEPROM[0x"); Serial.print(EEPROM_FLAG_ADDR, HEX); Serial.print("] = 0x");
+  if (val < 16) Serial.print('0');
+  Serial.print(val, HEX);
+  if (val == EEPROM_FLAG_VALUE) {
+    Serial.println("  (UPDATE_REQUESTED)");
+  } else if (val == 0xFF) {
+    Serial.println("  (CLEAR)");
+  } else {
+    Serial.println("  (UNKNOWN)");
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   SPI.begin();
+
+  // SPI master emniyeti: SS (D53) OUTPUT olsun
+  pinMode(53, OUTPUT);
+  digitalWrite(53, HIGH);
+
   pinMode(FLASH_CS, OUTPUT);
   pinMode(FLASH_WP, OUTPUT);
   pinMode(FLASH_HOLD, OUTPUT);
   digitalWrite(FLASH_CS, HIGH);
   digitalWrite(FLASH_WP, HIGH);
   digitalWrite(FLASH_HOLD, HIGH);
+
+  // EEPROM bayrağı oku ve yazdır
+  printEepromFlag();
 
   uint8_t m,t,c; readJEDEC(m,t,c);
   Serial.print("JEDEC "); Serial.print(m,HEX); Serial.print(' ');
