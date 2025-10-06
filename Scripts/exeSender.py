@@ -48,7 +48,7 @@ def ensure_intel_hex(data: bytes, path: str) -> bytes:
 def main():
     # Gömülü ayarlar (gerekirse düzenleyin)
     port = "COM12"
-    path = r"C:\\Users\\CatPawnD20\\Desktop\\ZDA - GPS\\EXE\\braud.ino.hex"
+    path = r"C:\\Users\\CatPawnD20\\Desktop\\ZDA - GPS\\EXE\\Blink.ino.hex"
 
     # Dosyayı oku
     with open(path, "rb") as f:
